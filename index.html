@@ -138,7 +138,7 @@
   <div class="bottom-row">
     <div class="controls">
       <button id="micBtn">マイクを開始</button>
-      <div class="hint">音の大きさに応じて波形が伸縮します。ブラウザのマイク許可が必要です。</div>
+      <div class="hint">その瞬間の音を周波数帯ごとに分解して表示します（履歴は残しません）。ブラウザのマイク許可が必要です。</div>
     </div>
     <div class="timer" id="timer">0:00</div>
   </div>
@@ -157,37 +157,25 @@
   const errEl = document.getElementById('err');
 
   let W, H, DPR;
+  let NUM_BARS = 120;
+  let smoothedBins = new Array(NUM_BARS).fill(0);
+
   function resize(){
     DPR = Math.min(window.devicePixelRatio || 1, 2);
     W = window.innerWidth; H = window.innerHeight;
     canvas.width = W * DPR; canvas.height = H * DPR;
     canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
     ctx.setTransform(DPR,0,0,DPR,0,0);
-    STEP = Math.max(2, Math.floor(W / 420));
-    const len = Math.ceil(W / STEP) + 4;
-    resizeHistory(len);
-  }
-
-  // ---- rolling amplitude history ----
-  let STEP = 4;
-  let history = [];
-  function resizeHistory(len){
-    if(history.length === 0){
-      history = new Array(len).fill(0);
-    } else if(len > history.length){
-      history = new Array(len - history.length).fill(0).concat(history);
-    } else if(len < history.length){
-      history = history.slice(history.length - len);
-    }
+    NUM_BARS = Math.max(60, Math.floor(W / 10));
+    if(smoothedBins.length !== NUM_BARS) smoothedBins = new Array(NUM_BARS).fill(0);
   }
 
   window.addEventListener('resize', resize);
   resize();
 
   // ---- audio setup ----
-  let audioCtx, analyser, dataArray, source, stream;
+  let audioCtx, analyser, freqData, source, stream;
   let running = false;
-  let smoothedAmp = 0;
   let startTime = 0;
   let timerInterval = null;
 
@@ -198,8 +186,9 @@
       }});
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 1024;
-      dataArray = new Uint8Array(analyser.fftSize);
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.75;
+      freqData = new Uint8Array(analyser.frequencyBinCount);
       source = audioCtx.createMediaStreamSource(stream);
       source.connect(analyser);
 
@@ -241,21 +230,26 @@
   });
 
   // ---- drawing ----
-  function pushAmplitude(v){
-    history.push(v);
-    if(history.length > Math.ceil(W/STEP) + 4) history.shift();
-  }
-
-  function getAmplitude(){
-    if(!running || !analyser) return 0;
-    analyser.getByteTimeDomainData(dataArray);
-    let sum = 0;
-    for(let i=0;i<dataArray.length;i++){
-      const v = (dataArray[i]-128)/128;
-      sum += v*v;
+  // maps NUM_BARS positions across the width to frequency bins on a log
+  // scale (low freq compressed on the left/right edges spread wider,
+  // matches how the ear perceives spectrum) and updates smoothedBins
+  // in-place each frame. No history is retained — only "now" is drawn.
+  function updateSpectrum(){
+    if(!running || !analyser){
+      for(let i=0;i<smoothedBins.length;i++) smoothedBins[i] *= 0.85;
+      return;
     }
-    const rms = Math.sqrt(sum/dataArray.length);
-    return Math.min(1, rms * 3.2);
+    analyser.getByteFrequencyData(freqData);
+    const n = freqData.length;
+    for(let i=0;i<smoothedBins.length;i++){
+      const t = i/(smoothedBins.length-1);
+      // straightforward low->high mapping across the width (log-ish
+      // spacing so low end isn't crushed into a few bars)
+      const idx = Math.min(n-1, Math.floor(Math.pow(t, 1.6) * (n*0.6)));
+      const v = freqData[idx] / 255;
+      const target = Math.min(1, v * 1.15);
+      smoothedBins[i] += (target - smoothedBins[i]) * 0.5;
+    }
   }
 
   function catmullRomPath(points){
@@ -272,21 +266,21 @@
   let frame = 0;
   function draw(){
     frame++;
-    const amp = getAmplitude();
-    smoothedAmp += (amp - smoothedAmp) * 0.35;
-    pushAmplitude(smoothedAmp);
+    updateSpectrum();
 
     ctx.clearRect(0,0,W,H);
 
     const centerY = H/2;
     const maxAmp = H * 0.34;
+    const STEP = W / (smoothedBins.length - 1);
 
-    // build top/bottom point arrays
+    // build top/bottom point arrays purely from the current spectrum —
+    // nothing here is carried over from a previous animation frame's shape
     const topPts = [];
     const botPts = [];
-    for(let i=0;i<history.length;i++){
+    for(let i=0;i<smoothedBins.length;i++){
       const x = i*STEP;
-      let a = history[i]*maxAmp;
+      let a = smoothedBins[i]*maxAmp;
       // tiny organic jitter for a "living" edge
       const jitter = a > 2 ? (Math.sin(i*0.7 + frame*0.12) * a * 0.06) : 0;
       a += jitter;
@@ -339,9 +333,9 @@
     for(let l=0;l<lines;l++){
       ctx.beginPath();
       const phase = l*0.9 + frame*0.02;
-      for(let i=0;i<history.length;i++){
+      for(let i=0;i<smoothedBins.length;i++){
         const x = i*STEP;
-        const a = history[i]*maxAmp;
+        const a = smoothedBins[i]*maxAmp;
         const yOff = Math.sin(i*0.35 + phase) * a * 0.55;
         const y = centerY + yOff;
         if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
@@ -356,7 +350,7 @@
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
     ctx.beginPath();
-    for(let i=0;i<history.length;i++){
+    for(let i=0;i<smoothedBins.length;i++){
       const x = i*STEP;
       const y = centerY;
       if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
@@ -371,8 +365,8 @@
     // sparkle particles near high-amplitude edges
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
-    for(let i=0;i<history.length;i+=3){
-      const a = history[i];
+    for(let i=0;i<smoothedBins.length;i+=3){
+      const a = smoothedBins[i];
       if(a < 0.12) continue;
       if(Math.random() > 0.55) continue;
       const x = i*STEP + (Math.random()-0.5)*STEP;
