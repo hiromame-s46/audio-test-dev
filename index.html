@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Waveform — リアルタイム音声波形</title>
+<style>
+  :root{
+    --bg: #0a090c;
+    --grain: rgba(255,255,255,0.02);
+    --purple-deep: #4a2f9e;
+    --purple: #8b5cf6;
+    --purple-bright: #c4a3ff;
+    --white-core: #ffffff;
+    --text-dim: rgba(235,230,245,0.45);
+    --text: #efeaf7;
+  }
+  *{ box-sizing: border-box; }
+  html,body{
+    margin:0; padding:0; height:100%;
+    background: var(--bg);
+    overflow:hidden;
+    font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+  }
+  body{
+    background-image:
+      radial-gradient(ellipse at 50% 40%, rgba(60,40,90,0.10), transparent 60%),
+      repeating-radial-gradient(circle at 20% 30%, rgba(255,255,255,0.015) 0px, transparent 2px);
+    position:relative;
+  }
+  #noise{
+    position:fixed; inset:0; pointer-events:none;
+    opacity:0.05; mix-blend-mode:overlay;
+  }
+  canvas#wave{
+    display:block;
+    width:100vw; height:100vh;
+  }
+
+  .hud{
+    position:fixed; inset:0; pointer-events:none;
+    display:flex; flex-direction:column; justify-content:space-between;
+    padding:28px 28px 22px 28px;
+  }
+  .top-row{
+    display:flex; justify-content:space-between; align-items:flex-start;
+    letter-spacing:0.08em;
+  }
+  .brand{
+    font-size:11px; text-transform:uppercase; color:var(--text-dim);
+    letter-spacing:0.22em; font-weight:500;
+  }
+  .status{
+    display:flex; align-items:center; gap:8px;
+    font-size:12px; color:var(--text-dim); letter-spacing:0.12em;
+  }
+  .dot{
+    width:7px; height:7px; border-radius:50%;
+    background:#555; transition: background .3s, box-shadow .3s;
+  }
+  .dot.live{
+    background:#ff5470;
+    box-shadow: 0 0 10px 2px rgba(255,84,112,0.7);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse{
+    0%,100%{ opacity:1; } 50%{ opacity:0.4; }
+  }
+
+  .bottom-row{
+    display:flex; justify-content:space-between; align-items:flex-end;
+    pointer-events:none;
+  }
+  .controls{
+    pointer-events:auto;
+    display:flex; align-items:center; gap:16px;
+  }
+  #micBtn{
+    pointer-events:auto;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.12);
+    color: var(--text);
+    padding:11px 22px;
+    border-radius:999px;
+    font-family:inherit;
+    font-size:12px;
+    letter-spacing:0.14em;
+    text-transform:uppercase;
+    cursor:pointer;
+    backdrop-filter: blur(6px);
+    transition: all .25s ease;
+  }
+  #micBtn:hover{
+    background: rgba(255,255,255,0.09);
+    border-color: rgba(196,163,255,0.5);
+  }
+  #micBtn.active{
+    background: rgba(139,92,246,0.18);
+    border-color: rgba(196,163,255,0.6);
+    color: var(--purple-bright);
+    box-shadow: 0 0 22px rgba(139,92,246,0.25);
+  }
+  .hint{
+    font-size:11px; color: var(--text-dim); letter-spacing:0.05em;
+    max-width:220px;
+  }
+  .timer{
+    font-size:16px; color: var(--text);
+    background: rgba(0,0,0,0.35);
+    border: 1px solid rgba(255,255,255,0.08);
+    padding:6px 14px;
+    border-radius:8px;
+    letter-spacing:0.06em;
+    backdrop-filter: blur(6px);
+  }
+
+  .err{
+    position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+    color: var(--text-dim); font-size:13px; text-align:center;
+    max-width:320px; line-height:1.6; letter-spacing:0.02em;
+    display:none;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="wave"></canvas>
+
+<div class="hud">
+  <div class="top-row">
+    <div class="brand">Waveform Study</div>
+    <div class="status">
+      <div class="dot" id="statusDot"></div>
+      <span id="statusText">Idle</span>
+    </div>
+  </div>
+
+  <div class="bottom-row">
+    <div class="controls">
+      <button id="micBtn">マイクを開始</button>
+      <div class="hint">音の大きさに応じて波形が伸縮します。ブラウザのマイク許可が必要です。</div>
+    </div>
+    <div class="timer" id="timer">0:00</div>
+  </div>
+</div>
+
+<div class="err" id="err">マイクにアクセスできませんでした。<br>ブラウザの設定でマイクの使用を許可してください。</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('wave');
+  const ctx = canvas.getContext('2d');
+  const micBtn = document.getElementById('micBtn');
+  const statusDot = document.getElementById('statusDot');
+  const statusText = document.getElementById('statusText');
+  const timerEl = document.getElementById('timer');
+  const errEl = document.getElementById('err');
+
+  let W, H, DPR;
+  function resize(){
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    STEP = Math.max(2, Math.floor(W / 420));
+    const len = Math.ceil(W / STEP) + 4;
+    resizeHistory(len);
+  }
+
+  // ---- rolling amplitude history ----
+  let STEP = 4;
+  let history = [];
+  function resizeHistory(len){
+    if(history.length === 0){
+      history = new Array(len).fill(0);
+    } else if(len > history.length){
+      history = new Array(len - history.length).fill(0).concat(history);
+    } else if(len < history.length){
+      history = history.slice(history.length - len);
+    }
+  }
+
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---- audio setup ----
+  let audioCtx, analyser, dataArray, source, stream;
+  let running = false;
+  let smoothedAmp = 0;
+  let startTime = 0;
+  let timerInterval = null;
+
+  async function startMic(){
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({ audio: {
+        echoCancellation:true, noiseSuppression:false, autoGainControl:false
+      }});
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      dataArray = new Uint8Array(analyser.fftSize);
+      source = audioCtx.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      running = true;
+      micBtn.textContent = 'マイクを停止';
+      micBtn.classList.add('active');
+      statusDot.classList.add('live');
+      statusText.textContent = 'Recording';
+      errEl.style.display = 'none';
+
+      startTime = Date.now();
+      timerInterval = setInterval(updateTimer, 500);
+    } catch(e){
+      errEl.style.display = 'block';
+      console.error(e);
+    }
+  }
+
+  function stopMic(){
+    running = false;
+    if(stream) stream.getTracks().forEach(t => t.stop());
+    if(audioCtx) audioCtx.close();
+    micBtn.textContent = 'マイクを開始';
+    micBtn.classList.remove('active');
+    statusDot.classList.remove('live');
+    statusText.textContent = 'Idle';
+    clearInterval(timerInterval);
+  }
+
+  function updateTimer(){
+    const s = Math.floor((Date.now() - startTime)/1000);
+    const m = Math.floor(s/60);
+    const ss = (s%60).toString().padStart(2,'0');
+    timerEl.textContent = `${m}:${ss}`;
+  }
+
+  micBtn.addEventListener('click', () => {
+    if(!running) startMic(); else stopMic();
+  });
+
+  // ---- drawing ----
+  function pushAmplitude(v){
+    history.push(v);
+    if(history.length > Math.ceil(W/STEP) + 4) history.shift();
+  }
+
+  function getAmplitude(){
+    if(!running || !analyser) return 0;
+    analyser.getByteTimeDomainData(dataArray);
+    let sum = 0;
+    for(let i=0;i<dataArray.length;i++){
+      const v = (dataArray[i]-128)/128;
+      sum += v*v;
+    }
+    const rms = Math.sqrt(sum/dataArray.length);
+    return Math.min(1, rms * 3.2);
+  }
+
+  function catmullRomPath(points){
+    // points: [{x,y}] -> smooth path string via quadratic mid-points
+    ctx.moveTo(points[0].x, points[0].y);
+    for(let i=0;i<points.length-1;i++){
+      const p0 = points[i], p1 = points[i+1];
+      const mx = (p0.x+p1.x)/2, my = (p0.y+p1.y)/2;
+      ctx.quadraticCurveTo(p0.x, p0.y, mx, my);
+    }
+    ctx.lineTo(points[points.length-1].x, points[points.length-1].y);
+  }
+
+  let frame = 0;
+  function draw(){
+    frame++;
+    const amp = getAmplitude();
+    smoothedAmp += (amp - smoothedAmp) * 0.35;
+    pushAmplitude(smoothedAmp);
+
+    ctx.clearRect(0,0,W,H);
+
+    const centerY = H/2;
+    const maxAmp = H * 0.34;
+
+    // build top/bottom point arrays
+    const topPts = [];
+    const botPts = [];
+    for(let i=0;i<history.length;i++){
+      const x = i*STEP;
+      let a = history[i]*maxAmp;
+      // tiny organic jitter for a "living" edge
+      const jitter = a > 2 ? (Math.sin(i*0.7 + frame*0.12) * a * 0.06) : 0;
+      a += jitter;
+      topPts.push({x, y: centerY - Math.max(a,0.6)});
+      botPts.push({x, y: centerY + Math.max(a,0.6)});
+    }
+
+    // ---- glow layers (blob fill) ----
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+
+    // wide soft glow
+    ctx.beginPath();
+    catmullRomPath(topPts);
+    for(let i=botPts.length-1;i>=0;i--) ctx.lineTo(botPts[i].x, botPts[i].y);
+    ctx.closePath();
+    const grad1 = ctx.createLinearGradient(0,centerY-maxAmp,0,centerY+maxAmp);
+    grad1.addColorStop(0,'rgba(139,92,246,0)');
+    grad1.addColorStop(0.5,'rgba(139,92,246,0.35)');
+    grad1.addColorStop(1,'rgba(139,92,246,0)');
+    ctx.fillStyle = grad1;
+    ctx.shadowColor = 'rgba(139,92,246,0.9)';
+    ctx.shadowBlur = 28;
+    ctx.fill();
+
+    // inner brighter core
+    ctx.beginPath();
+    catmullRomPath(topPts);
+    for(let i=botPts.length-1;i>=0;i--) ctx.lineTo(botPts[i].x, botPts[i].y);
+    ctx.closePath();
+    const grad2 = ctx.createLinearGradient(0,centerY-maxAmp*0.5,0,centerY+maxAmp*0.5);
+    grad2.addColorStop(0,'rgba(196,163,255,0)');
+    grad2.addColorStop(0.5,'rgba(210,190,255,0.55)');
+    grad2.addColorStop(1,'rgba(196,163,255,0)');
+    ctx.fillStyle = grad2;
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = 'rgba(196,163,255,0.8)';
+    ctx.fill();
+    ctx.restore();
+
+    // ---- fine textured wisps inside the blob ----
+    ctx.save();
+    ctx.beginPath();
+    catmullRomPath(topPts);
+    for(let i=botPts.length-1;i>=0;i--) ctx.lineTo(botPts[i].x, botPts[i].y);
+    ctx.closePath();
+    ctx.clip();
+    ctx.globalCompositeOperation = 'lighter';
+    const lines = 14;
+    for(let l=0;l<lines;l++){
+      ctx.beginPath();
+      const phase = l*0.9 + frame*0.02;
+      for(let i=0;i<history.length;i++){
+        const x = i*STEP;
+        const a = history[i]*maxAmp;
+        const yOff = Math.sin(i*0.35 + phase) * a * 0.55;
+        const y = centerY + yOff;
+        if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+      ctx.strokeStyle = `rgba(255,255,255,${0.02 + (l%3)*0.01})`;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // ---- bright white core line (baseline / thread through waveform) ----
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.beginPath();
+    for(let i=0;i<history.length;i++){
+      const x = i*STEP;
+      const y = centerY;
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.shadowColor = 'rgba(255,255,255,0.9)';
+    ctx.shadowBlur = 6;
+    ctx.lineWidth = 1.1;
+    ctx.stroke();
+    ctx.restore();
+
+    // sparkle particles near high-amplitude edges
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for(let i=0;i<history.length;i+=3){
+      const a = history[i];
+      if(a < 0.12) continue;
+      if(Math.random() > 0.55) continue;
+      const x = i*STEP + (Math.random()-0.5)*STEP;
+      const edge = a*maxAmp;
+      const y = centerY + (Math.random()-0.5)*edge*1.8;
+      const r = Math.random()*1.3 + 0.2;
+      ctx.beginPath();
+      ctx.arc(x,y,r,0,Math.PI*2);
+      ctx.fillStyle = `rgba(230,215,255,${0.15+Math.random()*0.35})`;
+      ctx.fill();
+    }
+    ctx.restore();
+
+    requestAnimationFrame(draw);
+  }
+
+  requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
